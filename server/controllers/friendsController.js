@@ -4,6 +4,8 @@ const Portfolio  = require("../models/Portfolio");
 const Coin       = require("../models/Coin");
 const { usdToCredits } = require("../config/coins");
 
+const escapeRegex = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
 // GET /api/friends/search?q=username
 const searchUsers = async (req, res, next) => {
   try {
@@ -12,7 +14,7 @@ const searchUsers = async (req, res, next) => {
       return res.status(400).json({ message: "Query must be at least 2 characters" });
 
     const users = await User.find({
-      username: { $regex: q, $options: "i" },
+      username: { $regex: escapeRegex(q), $options: "i" },
       _id: { $ne: req.user._id },
     }).select("username _id").limit(10);
 
@@ -50,6 +52,9 @@ const sendRequest = async (req, res, next) => {
 const respondRequest = async (req, res, next) => {
   try {
     const { action } = req.body;
+    if (!["accept", "reject"].includes(action))
+      return res.status(400).json({ message: "Action must be accept or reject" });
+
     const friendship = await Friendship.findById(req.params.friendshipId);
     if (!friendship) return res.status(404).json({ message: "Request not found" });
     if (friendship.recipient.toString() !== req.user._id.toString())
@@ -95,7 +100,12 @@ const getPending = async (req, res, next) => {
 // DELETE /api/friends/:friendshipId
 const removeFriend = async (req, res, next) => {
   try {
-    await Friendship.findByIdAndDelete(req.params.friendshipId);
+    const friendship = await Friendship.findOneAndDelete({
+      _id: req.params.friendshipId,
+      status: "accepted",
+      $or: [{ requester: req.user._id }, { recipient: req.user._id }],
+    });
+    if (!friendship) return res.status(404).json({ message: "Friendship not found" });
     res.json({ message: "Removed" });
   } catch (err) { next(err); }
 };

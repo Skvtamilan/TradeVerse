@@ -1,92 +1,183 @@
-const User        = require("../models/User");
-const Coin        = require("../models/Coin");
-const Portfolio   = require("../models/Portfolio");
+const mongoose = require("mongoose");
+const User = require("../models/User");
+const Coin = require("../models/Coin");
+const Portfolio = require("../models/Portfolio");
 const Transaction = require("../models/Transaction");
 const { usdToCredits } = require("../config/coins");
 
 const resolveTrade = (priceCredits, { quantityCredits, quantityCoins }) => {
-  if (quantityCredits) {
+  if (quantityCredits !== undefined && quantityCredits !== "") {
     const credits = parseFloat(quantityCredits);
+    if (!Number.isFinite(credits) || credits <= 0) return null;
     return { creditAmount: credits, coinQty: credits / priceCredits };
   }
-  if (quantityCoins) {
+
+  if (quantityCoins !== undefined && quantityCoins !== "") {
     const qty = parseFloat(quantityCoins);
+    if (!Number.isFinite(qty) || qty <= 0) return null;
     return { creditAmount: qty * priceCredits, coinQty: qty };
   }
+
   return null;
 };
 
-// POST /api/trade/buy
-const buy = async (req, res, next) => {
-  try {
-    const coin = await Coin.findOne({ id: req.body.coinId?.toUpperCase() });
-    if (!coin) return res.status(404).json({ message: "Coin not found" });
-
-    const priceCredits = usdToCredits(coin.currentPrice);
-    const trade = resolveTrade(priceCredits, req.body);
-    if (!trade || trade.coinQty <= 0)
-      return res.status(400).json({ message: "Provide a positive quantityCredits or quantityCoins" });
-
-    if (req.user.credits < trade.creditAmount)
-      return res.status(400).json({ message: "Insufficient credits" });
-
-    const user = await User.findByIdAndUpdate(
-      req.user._id,
-      { $inc: { credits: -trade.creditAmount } },
-      { new: true }
-    );
-
-    const portfolio = await Portfolio.findOne({ user: req.user._id });
-    portfolio.updateHolding(coin.id, trade.coinQty, coin.currentPrice);
-    await portfolio.save();
-
-    const tx = await Transaction.create({
-      user: req.user._id, type: "buy",
-      coinId: coin.id, coinName: coin.name,
-      quantity: trade.coinQty, priceUsd: coin.currentPrice,
-      totalUsd: trade.coinQty * coin.currentPrice,
-      creditsUsed: trade.creditAmount,
-    });
-
-    res.json({ credits: user.credits, coinQty: trade.coinQty, creditAmount: trade.creditAmount, tx });
-  } catch (err) { next(err); }
+const transactionOptions = {
+  readConcern: { level: "snapshot" },
+  writeConcern: { w: "majority" },
 };
 
-// POST /api/trade/sell
-const sell = async (req, res, next) => {
+const buy = async (req, res, next) => {
+  const session = await mongoose.startSession();
+
   try {
-    const coin = await Coin.findOne({ id: req.body.coinId?.toUpperCase() });
-    if (!coin) return res.status(404).json({ message: "Coin not found" });
+    let payload;
 
-    const priceCredits = usdToCredits(coin.currentPrice);
-    const trade = resolveTrade(priceCredits, req.body);
-    if (!trade || trade.coinQty <= 0)
-      return res.status(400).json({ message: "Provide a positive quantityCredits or quantityCoins" });
+    await session.withTransaction(async () => {
+      const coin = await Coin.findOne({ id: req.body.coinId?.toUpperCase() }).session(session);
+      if (!coin) {
+        const err = new Error("Coin not found");
+        err.statusCode = 404;
+        throw err;
+      }
 
-    const portfolio = await Portfolio.findOne({ user: req.user._id });
-    const holding   = portfolio.holdings.find(h => h.coinId === coin.id);
-    if (!holding || holding.quantity < trade.coinQty)
-      return res.status(400).json({ message: "Insufficient holdings" });
+      const priceCredits = usdToCredits(coin.currentPrice);
+      if (!Number.isFinite(priceCredits) || priceCredits <= 0) {
+        const err = new Error("Coin price is unavailable");
+        err.statusCode = 400;
+        throw err;
+      }
 
-    portfolio.updateHolding(coin.id, -trade.coinQty, coin.currentPrice);
-    await portfolio.save();
+      const trade = resolveTrade(priceCredits, req.body);
+      if (!trade) {
+        const err = new Error("Provide a positive quantityCredits or quantityCoins");
+        err.statusCode = 400;
+        throw err;
+      }
 
-    const user = await User.findByIdAndUpdate(
-      req.user._id,
-      { $inc: { credits: trade.creditAmount } },
-      { new: true }
-    );
+      const user = await User.findOneAndUpdate(
+        { _id: req.user._id, credits: { $gte: trade.creditAmount } },
+        { $inc: { credits: -trade.creditAmount } },
+        { new: true, session }
+      );
+      if (!user) {
+        const err = new Error("Insufficient credits");
+        err.statusCode = 400;
+        throw err;
+      }
 
-    const tx = await Transaction.create({
-      user: req.user._id, type: "sell",
-      coinId: coin.id, coinName: coin.name,
-      quantity: trade.coinQty, priceUsd: coin.currentPrice,
-      totalUsd: trade.coinQty * coin.currentPrice,
-      creditsUsed: trade.creditAmount,
-    });
+      const portfolio = await Portfolio.findOne({ user: req.user._id }).session(session);
+      if (!portfolio) {
+        const err = new Error("Portfolio not found");
+        err.statusCode = 404;
+        throw err;
+      }
 
-    res.json({ credits: user.credits, coinQty: trade.coinQty, creditAmount: trade.creditAmount, tx });
-  } catch (err) { next(err); }
+      portfolio.updateHolding(coin.id, trade.coinQty, coin.currentPrice);
+      await portfolio.save({ session });
+
+      const [tx] = await Transaction.create([{
+        user: req.user._id,
+        type: "buy",
+        coinId: coin.id,
+        coinName: coin.name,
+        quantity: trade.coinQty,
+        priceUsd: coin.currentPrice,
+        totalUsd: trade.coinQty * coin.currentPrice,
+        creditsUsed: trade.creditAmount,
+      }], { session });
+
+      payload = {
+        credits: user.credits,
+        coinQty: trade.coinQty,
+        creditAmount: trade.creditAmount,
+        tx,
+      };
+    }, transactionOptions);
+
+    res.json(payload);
+  } catch (err) {
+    next(err);
+  } finally {
+    await session.endSession();
+  }
+};
+
+const sell = async (req, res, next) => {
+  const session = await mongoose.startSession();
+
+  try {
+    let payload;
+
+    await session.withTransaction(async () => {
+      const coin = await Coin.findOne({ id: req.body.coinId?.toUpperCase() }).session(session);
+      if (!coin) {
+        const err = new Error("Coin not found");
+        err.statusCode = 404;
+        throw err;
+      }
+
+      const priceCredits = usdToCredits(coin.currentPrice);
+      if (!Number.isFinite(priceCredits) || priceCredits <= 0) {
+        const err = new Error("Coin price is unavailable");
+        err.statusCode = 400;
+        throw err;
+      }
+
+      const trade = resolveTrade(priceCredits, req.body);
+      if (!trade) {
+        const err = new Error("Provide a positive quantityCredits or quantityCoins");
+        err.statusCode = 400;
+        throw err;
+      }
+
+      const portfolio = await Portfolio.findOne({ user: req.user._id }).session(session);
+      if (!portfolio) {
+        const err = new Error("Portfolio not found");
+        err.statusCode = 404;
+        throw err;
+      }
+
+      const holding = portfolio.holdings.find((h) => h.coinId === coin.id);
+      if (!holding || holding.quantity < trade.coinQty) {
+        const err = new Error("Insufficient holdings");
+        err.statusCode = 400;
+        throw err;
+      }
+
+      portfolio.updateHolding(coin.id, -trade.coinQty, coin.currentPrice);
+      await portfolio.save({ session });
+
+      const user = await User.findByIdAndUpdate(
+        req.user._id,
+        { $inc: { credits: trade.creditAmount } },
+        { new: true, session }
+      );
+
+      const [tx] = await Transaction.create([{
+        user: req.user._id,
+        type: "sell",
+        coinId: coin.id,
+        coinName: coin.name,
+        quantity: trade.coinQty,
+        priceUsd: coin.currentPrice,
+        totalUsd: trade.coinQty * coin.currentPrice,
+        creditsUsed: trade.creditAmount,
+      }], { session });
+
+      payload = {
+        credits: user.credits,
+        coinQty: trade.coinQty,
+        creditAmount: trade.creditAmount,
+        tx,
+      };
+    }, transactionOptions);
+
+    res.json(payload);
+  } catch (err) {
+    next(err);
+  } finally {
+    await session.endSession();
+  }
 };
 
 module.exports = { buy, sell };

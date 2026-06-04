@@ -3,6 +3,7 @@ import { useParams, useNavigate }      from "react-router-dom";
 import { useAuth }   from "../../context/AuthContext";
 import { useMarket } from "../../context/MarketContext";
 import { getConversation, getFriends } from "../../services/api";
+import { showToast } from "../Layout/Layout";
 
 const bubble = (isMe) => ({
   maxWidth: "72%",
@@ -63,8 +64,15 @@ export default function ChatWindow() {
         });
       }
     };
+    const errorHandler = (err) => {
+      showToast(err?.message || "Message failed", "error");
+    };
     sock.on("newMessage", handler);
-    return () => sock.off("newMessage", handler);
+    sock.on("messageError", errorHandler);
+    return () => {
+      sock.off("newMessage", handler);
+      sock.off("messageError", errorHandler);
+    };
   }, [userId, socket]);
 
   // Scroll to bottom on new messages

@@ -1,6 +1,7 @@
 import { createContext, useContext, useState, useEffect, useRef } from "react";
 import { io } from "socket.io-client";
 import { getCoins } from "../services/api";
+import BASE_URL from "../config";
 
 const MarketContext = createContext(null);
 
@@ -21,10 +22,7 @@ export const MarketProvider = ({ children }) => {
 
   useEffect(() => {
     const token  = localStorage.getItem("token");
-    const socket = io(
-      process.env.NODE_ENV === "production" ? "/" : "http://localhost:5000",
-      { transports: ["websocket"], auth: { token } }
-    );
+    const socket = io(BASE_URL, { transports: ["websocket"], auth: { token } });
     socketRef.current = socket;
 
     socket.on("connect",    () => setConnected(true));
